@@ -115,14 +115,47 @@ ssh fedora@192.168.150.10 "kubectl get nodes -o wide"
 
 ```
 
+**Expected Output:**
+
+```text
+NAME           STATUS   ROLES           AGE   VERSION    INTERNAL-IP      EXTERNAL-IP   OS-IMAGE                          KERNEL-VERSION            CONTAINER-RUNTIME
+k8s-master     Ready    control-plane   31m   v1.30.14   192.168.150.10   <none>        Fedora Linux 44 (Cloud Edition)   6.19.10-300.fc44.x86_64   containerd://2.3.3
+k8s-worker-1   Ready    <none>          30m   v1.30.14   192.168.150.11   <none>        Fedora Linux 44 (Cloud Edition)   6.19.10-300.fc44.x86_64   containerd://2.3.3
+k8s-worker-2   Ready    <none>          27m   v1.30.14   192.168.150.12   <none>        Fedora Linux 44 (Cloud Edition)   6.19.10-300.fc44.x86_64   containerd://2.3.3
+
+```
+
+---
+
 ### 2. Verify Pod Health
 
-Check that all control plane and CNI pods are running cleanly:
+Check that all control plane and CNI pods are running cleanly across all namespaces:
 
 ```bash
 ssh fedora@192.168.150.10 "kubectl get pods -A"
 
 ```
+
+**Expected Output:**
+
+```text
+NAMESPACE      NAME                                 READY   STATUS    RESTARTS   AGE
+kube-flannel   kube-flannel-ds-66jdh                1/1     Running   0          27m
+kube-flannel   kube-flannel-ds-dt7m9                1/1     Running   0          27m
+kube-flannel   kube-flannel-ds-fg2tw                1/1     Running   0          27m
+kube-system    coredns-55cb58b774-hdfsp             1/1     Running   0          31m
+kube-system    coredns-55cb58b774-jchn6             1/1     Running   0          31m
+kube-system    etcd-k8s-master                      1/1     Running   0          31m
+kube-system    kube-apiserver-k8s-master            1/1     Running   0          31m
+kube-system    kube-controller-manager-k8s-master   1/1     Running   0          31m
+kube-system    kube-proxy-2xhgw                     1/1     Running   0          27m
+kube-system    kube-proxy-8hz54                     1/1     Running   0          30m
+kube-system    kube-proxy-8pnb9                     1/1     Running   0          31m
+kube-system    kube-scheduler-k8s-master            1/1     Running   0          31m
+
+```
+
+---
 
 ### 3. Test DNS & Connectivity
 
@@ -130,6 +163,18 @@ Run a temporary test pod to ensure internal DNS and pod-to-pod networking are op
 
 ```bash
 ssh fedora@192.168.150.10 "kubectl run nettest --image=busybox:1.28 --rm -it --restart=Never -- nslookup kubernetes.default"
+
+```
+
+**Expected Output:**
+
+```text
+Server:    10.96.0.10
+Address 1: 10.96.0.10 kube-dns.kube-system.svc.cluster.local
+
+Name:      kubernetes.default
+Address 1: 10.96.0.1 kubernetes.default.svc.cluster.local
+pod "nettest" deleted
 
 ```
 
