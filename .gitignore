@@ -9,7 +9,6 @@ crash.log
 *.pdf
 
 # === Ansible Runtime & Inventories ===
-inventory.ini
 *.retry
 
 # === Local Configuration Backups ===
