@@ -1,0 +1,229 @@
+---
+- name: Prepare all Fedora nodes for Kubernetes
+  hosts: all
+  become: true
+  handlers:
+    - name: Reload sysctl
+      ansible.builtin.command: sysctl --system
+    - name: Restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+
+  tasks:
+    - name: Set SELinux to Permissive in runtime
+      ansible.builtin.command: setenforce 0
+      ignore_errors: true
+
+    - name: Ensure SELinux remains Permissive across reboots
+      ansible.posix.selinux:
+        policy: targeted
+        state: permissive
+
+    - name: Populate service facts
+      ansible.builtin.service_facts:
+
+    - name: Ensure firewalld is stopped and disabled if present
+      ansible.builtin.service:
+        name: firewalld
+        state: stopped
+        enabled: false
+      when: "'firewalld.service' in ansible_facts.services"
+
+    - name: Disable SWAP and zRAM
+      ansible.builtin.shell: |
+        swapoff -a
+        systemctl stop swap-create-zram-0.service || true
+        touch /etc/systemd/zram-generator.conf
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+    - name: Stop NetworkManager from managing CNI virtual interfaces
+      ansible.builtin.copy:
+        dest: /etc/NetworkManager/conf.d/k8s.conf
+        content: |
+          [keyfile]
+          unmanaged-devices=interface-name:cni0;interface-name:flannel.1;interface-name:veth*
+        mode: '0644'
+
+    - name: Ensure kernel modules load on boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Load kernel modules immediately
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Configure sysctl for Kubernetes networking
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+      notify: Reload sysctl
+
+    - name: Add Kubernetes RPM Repository
+      ansible.builtin.yum_repository:
+        name: kubernetes
+        description: Kubernetes
+        baseurl: https://pkgs.k8s.io/core:/stable:/v1.30/rpm/
+        enabled: true
+        gpgcheck: true
+        repo_gpgcheck: true
+        gpgkey: https://pkgs.k8s.io/core:/stable:/v1.30/rpm/repodata/repomd.xml.key
+
+    - name: Install Kubernetes & Containerd packages
+      ansible.builtin.dnf:
+        name:
+          - iproute-tc
+          - containerd
+          - runc
+          - crun
+          - kubelet
+          - kubeadm
+          - kubectl
+          - kubernetes-cni
+        state: present
+        update_cache: true
+        disable_gpg_check: true
+
+    - name: Ensure /opt/cni/bin directory exists
+      ansible.builtin.file:
+        path: /opt/cni/bin
+        state: directory
+        mode: '0755'
+
+    - name: Ensure /usr/libexec/cni symlinks to /opt/cni/bin for Fedora package compatibility
+      ansible.builtin.file:
+        src: /opt/cni/bin
+        dest: /usr/libexec/cni
+        state: link
+        force: true
+
+    - name: Generate default containerd config with SystemdCgroup enabled
+      ansible.builtin.shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+      notify: Restart containerd
+
+    - name: Update containerd pause image
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'registry.k8s.io/pause:3.8'
+        replace: 'registry.k8s.io/pause:3.9'
+      notify: Restart containerd
+
+    - name: Configure crictl default endpoint
+      ansible.builtin.copy:
+        dest: /etc/crictl.yaml
+        content: |
+          runtime-endpoint: unix:///run/containerd/containerd.sock
+          image-endpoint: unix:///run/containerd/containerd.sock
+          timeout: 10
+          debug: false
+
+    - name: Force all notified handlers to run right now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Configure kubelet to use systemd cgroup driver
+      ansible.builtin.copy:
+        dest: /etc/sysconfig/kubelet
+        content: |
+          KUBELET_EXTRA_ARGS="--cgroup-driver=systemd"
+
+    - name: Restart and enable containerd & kubelet
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: true
+      loop:
+        - containerd
+        - kubelet
+
+- name: Setup Control Plane (Master)
+  hosts: masters
+  become: true
+  tasks:
+    - name: Create kubeadm config template for kube-proxy
+      ansible.builtin.copy:
+        dest: /tmp/kubeadm-config.yaml
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: InitConfiguration
+          localAPIEndpoint:
+            advertiseAddress: "{{ ansible_default_ipv4.address }}"
+            bindPort: 6443
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          networking:
+            podSubnet: "10.244.0.0/16"
+          ---
+          apiVersion: kubeproxy.config.k8s.io/v1alpha1
+          kind: KubeProxyConfiguration
+          mode: "iptables"
+
+    - name: Initialize Kubernetes Control Plane
+      ansible.builtin.shell: >
+        kubeadm init --config=/tmp/kubeadm-config.yaml
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Ensure .kube directory exists for fedora user
+      ansible.builtin.file:
+        path: /home/fedora/.kube
+        state: directory
+        owner: fedora
+        group: fedora
+        mode: '0700'
+
+    - name: Copy admin.conf to fedora user kubeconfig
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/fedora/.kube/config
+        remote_src: true
+        owner: fedora
+        group: fedora
+        mode: '0600'
+
+    - name: Wait for Kubernetes API server to respond
+      ansible.builtin.wait_for:
+        host: "{{ ansible_default_ipv4.address }}"
+        port: 6443
+        delay: 5
+        timeout: 60
+
+    - name: Deploy Flannel CNI Plugin
+      ansible.builtin.command: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+    - name: Generate worker join token command
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_command_raw
+
+    - name: Store join command in facts
+      ansible.builtin.set_fact:
+        join_command: "{{ join_command_raw.stdout }}"
+
+- name: Setup Worker Nodes
+  hosts: workers
+  become: true
+  tasks:
+    - name: Join Worker Node to Master
+      ansible.builtin.command: "{{ hostvars[groups['masters'][0]]['join_command'] }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+
+- name: Post-Setup Cluster Synchronization
+  hosts: masters
+  become: true
+  tasks:
+    - name: Restart Flannel DaemonSet to re-establish overlay bridges
+      ansible.builtin.command: kubectl --kubeconfig=/etc/kubernetes/admin.conf rollout restart daemonset kube-flannel-ds -n kube-flannel

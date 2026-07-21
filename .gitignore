@@ -1,0 +1,17 @@
+# === Terraform Runtime & State ===
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+
+# === Ignore all pdf
+*.pdf
+
+# === Ansible Runtime & Inventories ===
+inventory.ini
+*.retry
+
+# === Local Configuration Backups ===
+*.bak
+main.tf.[0-9]*
