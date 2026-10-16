@@ -105,6 +105,10 @@
         repo_gpgcheck: true
         gpgkey: https://pkgs.k8s.io/core:/stable:/v1.30/rpm/repodata/repomd.xml.key
 
+    - name: Refresh repository metadata cache explicitly
+      ansible.builtin.dnf:
+        update_cache: yes
+
     - name: Install Kubernetes & Containerd packages
       ansible.builtin.dnf:
         name:
