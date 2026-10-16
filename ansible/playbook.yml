@@ -5,6 +5,7 @@
   handlers:
     - name: Reload sysctl
       ansible.builtin.command: sysctl --system
+
     - name: Restart containerd
       ansible.builtin.systemd:
         name: containerd
@@ -30,13 +31,38 @@
         enabled: false
       when: "'firewalld.service' in ansible_facts.services"
 
-    - name: Disable SWAP and zRAM
-      ansible.builtin.shell: |
-        swapoff -a
-        systemctl stop swap-create-zram-0.service || true
-        touch /etc/systemd/zram-generator.conf
-        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+    - name: Ensure zram-generator configuration file exists to disable zRAM
+      ansible.builtin.file:
+        path: /etc/systemd/zram-generator.conf
+        state: touch
+        mode: '0644'
 
+    - name: Turn off active zram swap immediately
+      ansible.builtin.command:
+        cmd: swapoff /dev/zram0
+      register: swapoff_zram
+      failed_when: false # Fails gracefully if zram0 isn't currently mounted/active
+      changed_when: swapoff_zram.rc == 0
+
+    - name: Ensure zram-generator config placeholder exists
+      ansible.builtin.file:
+        path: /etc/systemd/zram-generator.conf
+        state: touch
+        mode: '0644'
+
+    - name: Disable swap immediately in the kernel
+      ansible.builtin.command:
+        cmd: swapoff -a
+      # You can make a command module idempotent by checking if swap is still active, 
+      # or using changed_when based on output, but native modules are preferred where possible.
+
+    - name: Safely comment out swap entries in fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^(\s*)([^#].*\s+swap\s+.*)'
+        line: '#\1\2'
+        backrefs: yes
+    
     - name: Stop NetworkManager from managing CNI virtual interfaces
       ansible.builtin.copy:
         dest: /etc/NetworkManager/conf.d/k8s.conf
@@ -152,20 +178,26 @@
   hosts: masters
   become: true
   tasks:
-    - name: Create kubeadm config template for kube-proxy
+    - name: Create kubeadm config template
       ansible.builtin.copy:
         dest: /tmp/kubeadm-config.yaml
         content: |
           apiVersion: kubeadm.k8s.io/v1beta3
           kind: InitConfiguration
+          nodeRegistration:
+            criSocket: "unix:///run/containerd/containerd.sock"
           localAPIEndpoint:
-            advertiseAddress: "{{ ansible_default_ipv4.address }}"
+            advertiseAddress: "{{ ansible_facts.default_ipv4.address }}"
             bindPort: 6443
           ---
           apiVersion: kubeadm.k8s.io/v1beta3
           kind: ClusterConfiguration
           networking:
             podSubnet: "10.244.0.0/16"
+          etcd:
+            local:
+              extraArgs:
+                listen-metrics-urls: "http://0.0.0.0:2381"
           ---
           apiVersion: kubeproxy.config.k8s.io/v1alpha1
           kind: KubeProxyConfiguration
@@ -176,6 +208,12 @@
         kubeadm init --config=/tmp/kubeadm-config.yaml
       args:
         creates: /etc/kubernetes/admin.conf
+
+    - name: Fix etcd liveness probe path in static pod manifest
+      ansible.builtin.replace:
+        path: /etc/kubernetes/manifests/etcd.yaml
+        regexp: 'path: /healthz'
+        replace: 'path: /health'
 
     - name: Ensure .kube directory exists for fedora user
       ansible.builtin.file:
@@ -196,7 +234,7 @@
 
     - name: Wait for Kubernetes API server to respond
       ansible.builtin.wait_for:
-        host: "{{ ansible_default_ipv4.address }}"
+        host: "{{ ansible_facts.default_ipv4.address }}"
         port: 6443
         delay: 5
         timeout: 60
@@ -212,14 +250,21 @@
       ansible.builtin.set_fact:
         join_command: "{{ join_command_raw.stdout }}"
 
+    - name: Verify selected network facts for Kubernetes
+      ansible.builtin.debug:
+        msg: "Node {{ inventory_hostname }} is using IP {{ ansible_facts.default_ipv4.address }} on interface {{ ansible_facts.default_ipv4.interface }}"
+
 - name: Setup Worker Nodes
   hosts: workers
   become: true
   tasks:
     - name: Join Worker Node to Master
-      ansible.builtin.command: "{{ hostvars[groups['masters'][0]]['join_command'] }}"
+      ansible.builtin.command: "{{ hostvars[groups['masters'][0]]['join_command'] }} --cri-socket=unix:///run/containerd/containerd.sock"
       args:
         creates: /etc/kubernetes/kubelet.conf
+    - name: Verify selected network facts for Kubernetes
+      ansible.builtin.debug:
+        msg: "Node {{ inventory_hostname }} is using IP {{ ansible_facts.default_ipv4.address }} on interface {{ ansible_facts.default_ipv4.interface }}"
 
 - name: Post-Setup Cluster Synchronization
   hosts: masters
